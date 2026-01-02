@@ -1005,7 +1005,7 @@ def grade(model_answer: str, gt_answer: str, fast: bool = True):
     return correct
 
 
-def r1_zero_reward_fn(response, ground_truth, fast=True):
+def r1_zero_reward_fn(response: str, ground_truth: str, fast: bool = True) -> dict[str, float]:
     # We are strict about format to evaluate our models.
     if "</think> <answer>" in response and "</answer>" in response:
         model_answer = response.split("<answer>")[-1].replace("</answer>", "")

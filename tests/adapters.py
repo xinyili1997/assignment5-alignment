@@ -7,7 +7,43 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
+from vllm import outputs
 
+def tokenize_prompt_and_output( 
+    prompt_strs: list[str],
+    output_strs: list[str],
+    tokenizer: PreTrainedTokenizerBase,
+) -> dict[str, Tensor]:
+    # Tokenize prompts to get their lengths (no special tokens for accurate length)
+    prompt_tokens = tokenizer(prompt_strs, add_special_tokens=False)["input_ids"]
+    output_tokens = tokenizer(output_strs, add_special_tokens=False)["input_ids"]
+    combined_tokens = [p + o for p, o in zip(prompt_tokens, output_tokens)]
+    
+    # Pad to max length
+    max_len = max(len(tokens) for tokens in combined_tokens)
+    padded = []
+    attention_mask = []
+    for i in range(len(combined_tokens)):
+        tokens = combined_tokens[i]
+        prompt = prompt_tokens[i]
+        pad_len = max_len - len(tokens)
+        padded.append(tokens + [tokenizer.pad_token_id] * pad_len)
+        attention_mask.append([0] * len(prompt) + [1] * (len(tokens) - len(prompt)) + [0] * pad_len)
+    
+    # Convert to tensors
+    padded_tensor = torch.tensor(padded, dtype=torch.long)
+    attention_mask_tensor = torch.tensor(attention_mask, dtype=torch.bool)
+
+    # Slice off last token for input_ids, first token for labels
+    # Also slice response_mask to match (use labels-aligned version, i.e., slice first)
+    # print(f"combined_tokens['input_ids'].shape: {padded_tensor.shape}")
+    # print(f"tokens['input_ids'][:, :-1].shape: {padded_tensor[:, :-1].shape}")
+    result = {
+        "input_ids": padded_tensor[:, :-1],
+        "labels": padded_tensor[:, 1:],
+        "response_mask": attention_mask_tensor[:, 1:],  # Align with labels
+    }
+    return result
 
 def run_tokenize_prompt_and_output(
     prompt_strs: list[str],
@@ -31,7 +67,7 @@ def run_tokenize_prompt_and_output(
             "response_mask": torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1):
                 a mask on the response tokens in `labels`.
     """
-    raise NotImplementedError
+    return tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer)
 
 
 def run_compute_group_normalized_rewards(
