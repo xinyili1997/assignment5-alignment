@@ -119,6 +119,243 @@ def get_response_log_probs(
     return result
 
 
+def log_generations(
+    tokenizer: PreTrainedTokenizerBase,
+    prompts: list[str],
+    ground_truths: list[str],
+    reward_fn: Callable[[str, str], dict[str, float]],
+    generated_responses: list[str],
+    model: torch.nn.Module | None = None,
+    device: str = "cpu",
+) -> dict[str, Any]:
+    """Log generations with detailed metrics for training monitoring.
+
+    Args:
+        tokenizer: Tokenizer for tokenization.
+        prompts: List of input prompts.
+        ground_truths: List of ground truth answers.
+        reward_fn: Function that takes (response, ground_truth) and returns reward dict.
+        generated_responses: Pre-generated responses (required).
+        model: Optional PyTorch model for computing entropy. If None, entropy will be skipped.
+        device: Device to run model on (only used if model is provided).
+
+    Returns:
+        dict containing:
+            - "examples": list of dicts with per-example info (prompt, response, ground_truth, rewards, entropy)
+            - "summary": dict with aggregated metrics (avg response length, avg entropy, etc.)
+    """
+    examples = []
+    all_response_lengths = []
+    all_entropies = []
+    correct_lengths = []
+    incorrect_lengths = []
+
+    # Compute metrics for each example
+    for prompt, response, ground_truth in zip(
+        prompts, generated_responses, ground_truths
+    ):
+        # Compute rewards
+        rewards = reward_fn(response, ground_truth)
+
+        # Response length (in tokens)
+        response_tokens = tokenizer(response, add_special_tokens=False)["input_ids"]
+        response_length = len(response_tokens)
+
+        # Compute token entropy if model is provided
+        avg_entropy = None
+        if model is not None:
+            model.eval()
+            with torch.no_grad():
+                # Tokenize prompt + response for entropy computation
+                tokenized = tokenize_prompt_and_output([prompt], [response], tokenizer)
+                input_ids = tokenized["input_ids"].to(device)
+                labels = tokenized["labels"].to(device)
+                response_mask = tokenized["response_mask"].to(device)
+
+                # Get log probs and entropy
+                log_probs_result = get_response_log_probs(
+                    model, input_ids, labels, return_token_entropy=True
+                )
+                token_entropy = log_probs_result[
+                    "token_entropy"
+                ]  # [batch_size, seq_length]
+
+                # Average entropy over response tokens only
+                avg_entropy = masked_mean(token_entropy, response_mask, dim=None).item()
+
+        # Store per-example info
+        example_info = {
+            "prompt": prompt,
+            "response": response,
+            "ground_truth": ground_truth,
+            "rewards": rewards,
+            "response_length": response_length,
+        }
+        if avg_entropy is not None:
+            example_info["avg_token_entropy"] = avg_entropy
+        examples.append(example_info)
+
+        # Collect for summary stats
+        all_response_lengths.append(response_length)
+        if avg_entropy is not None:
+            all_entropies.append(avg_entropy)
+
+        # Check if correct (reward > 0 means correct)
+        is_correct = rewards.get("reward", 0) > 0
+        if is_correct:
+            correct_lengths.append(response_length)
+        else:
+            incorrect_lengths.append(response_length)
+
+    # Compute summary statistics
+    avg_response_length = (
+        sum(all_response_lengths) / len(all_response_lengths)
+        if all_response_lengths
+        else 0.0
+    )
+    avg_entropy = sum(all_entropies) / len(all_entropies) if all_entropies else None
+    avg_correct_length = (
+        sum(correct_lengths) / len(correct_lengths) if correct_lengths else 0.0
+    )
+    avg_incorrect_length = (
+        sum(incorrect_lengths) / len(incorrect_lengths) if incorrect_lengths else 0.0
+    )
+
+    summary = {
+        "avg_response_length": avg_response_length,
+        "avg_correct_response_length": avg_correct_length,
+        "avg_incorrect_response_length": avg_incorrect_length,
+        "num_examples": len(examples),
+        "num_correct": len(correct_lengths),
+        "num_incorrect": len(incorrect_lengths),
+    }
+    if avg_entropy is not None:
+        summary["avg_token_entropy"] = avg_entropy
+
+    return {
+        "examples": examples,
+        "summary": summary,
+    }
+
+
+def log_generations_with_policy(
+    policy_model: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    prompts: list[str],
+    ground_truths: list[str],
+    reward_fn: Callable[[str, str], dict[str, float]],
+    generated_responses: list[str],
+    device: str = "cpu",
+) -> dict[str, Any]:
+    """Log generations with detailed metrics using a PyTorch policy model.
+
+    This version requires a policy_model and always computes token entropy.
+    Use this when you have a PyTorch model available for entropy computation.
+
+    Args:
+        policy_model: PyTorch model (required) for computing entropy.
+        tokenizer: Tokenizer for tokenization.
+        prompts: List of input prompts.
+        ground_truths: List of ground truth answers.
+        reward_fn: Function that takes (response, ground_truth) and returns reward dict.
+        generated_responses: Pre-generated responses (required).
+        device: Device to run model on.
+
+    Returns:
+        dict containing:
+            - "examples": list of dicts with per-example info (prompt, response, ground_truth, rewards, entropy)
+            - "summary": dict with aggregated metrics (avg response length, avg entropy, etc.)
+    """
+    examples = []
+    all_response_lengths = []
+    all_entropies = []
+    correct_lengths = []
+    incorrect_lengths = []
+
+    policy_model.eval()
+
+    # Compute metrics for each example
+    with torch.no_grad():
+        for prompt, response, ground_truth in zip(
+            prompts, generated_responses, ground_truths
+        ):
+            # Compute rewards
+            rewards = reward_fn(response, ground_truth)
+
+            # Response length (in tokens)
+            response_tokens = tokenizer(response, add_special_tokens=False)["input_ids"]
+            response_length = len(response_tokens)
+
+            # Compute token entropy using policy model
+            # Tokenize prompt + response for entropy computation
+            tokenized = tokenize_prompt_and_output([prompt], [response], tokenizer)
+            input_ids = tokenized["input_ids"].to(device)
+            labels = tokenized["labels"].to(device)
+            response_mask = tokenized["response_mask"].to(device)
+
+            # Get log probs and entropy
+            log_probs_result = get_response_log_probs(
+                policy_model, input_ids, labels, return_token_entropy=True
+            )
+            token_entropy = log_probs_result[
+                "token_entropy"
+            ]  # [batch_size, seq_length]
+
+            # Average entropy over response tokens only
+            avg_entropy = masked_mean(token_entropy, response_mask, dim=None).item()
+
+            # Store per-example info
+            example_info = {
+                "prompt": prompt,
+                "response": response,
+                "ground_truth": ground_truth,
+                "rewards": rewards,
+                "avg_token_entropy": avg_entropy,
+                "response_length": response_length,
+            }
+            examples.append(example_info)
+
+            # Collect for summary stats
+            all_response_lengths.append(response_length)
+            all_entropies.append(avg_entropy)
+
+            # Check if correct (reward > 0 means correct)
+            is_correct = rewards.get("reward", 0) > 0
+            if is_correct:
+                correct_lengths.append(response_length)
+            else:
+                incorrect_lengths.append(response_length)
+
+    # Compute summary statistics
+    avg_response_length = (
+        sum(all_response_lengths) / len(all_response_lengths)
+        if all_response_lengths
+        else 0.0
+    )
+    avg_entropy = sum(all_entropies) / len(all_entropies) if all_entropies else 0.0
+    avg_correct_length = (
+        sum(correct_lengths) / len(correct_lengths) if correct_lengths else 0.0
+    )
+    avg_incorrect_length = (
+        sum(incorrect_lengths) / len(incorrect_lengths) if incorrect_lengths else 0.0
+    )
+
+    summary = {
+        "avg_response_length": avg_response_length,
+        "avg_token_entropy": avg_entropy,
+        "avg_correct_response_length": avg_correct_length,
+        "avg_incorrect_response_length": avg_incorrect_length,
+        "num_examples": len(examples),
+        "num_correct": len(correct_lengths),
+        "num_incorrect": len(incorrect_lengths),
+    }
+
+    return {
+        "examples": examples,
+        "summary": summary,
+    }
+
+
 def sft_microbatch_train_step(
     policy_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
@@ -519,7 +756,9 @@ def compute_policy_gradient_loss(
         assert advantages is not None
         return compute_naive_policy_gradient_loss(advantages, policy_log_probs), {}
     elif loss_type == "grpo_clip":
-        return compute_grpo_clip_loss(advantages, policy_log_probs, old_log_probs, cliprange)
+        return compute_grpo_clip_loss(
+            advantages, policy_log_probs, old_log_probs, cliprange
+        )
     else:
         raise NotImplementedError
 
