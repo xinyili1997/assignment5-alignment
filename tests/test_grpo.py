@@ -1,12 +1,12 @@
 import torch
 
 from .adapters import (
-    run_compute_group_normalized_rewards as compute_group_normalized_rewards,
-    run_compute_grpo_clip_loss as compute_grpo_clip_loss,
-    run_compute_naive_policy_gradient_loss as compute_naive_policy_gradient_loss,
-    run_compute_policy_gradient_loss as compute_policy_gradient_loss,
-    run_grpo_microbatch_train_step as grpo_microbatch_train_step,
-    run_masked_mean as masked_mean,
+    compute_group_normalized_rewards as compute_group_normalized_rewards,
+    compute_grpo_clip_loss as compute_grpo_clip_loss,
+    compute_naive_policy_gradient_loss as compute_naive_policy_gradient_loss,
+    compute_policy_gradient_loss as compute_policy_gradient_loss,
+    grpo_microbatch_train_step as grpo_microbatch_train_step,
+    masked_mean as masked_mean,
 )
 
 
@@ -247,4 +247,6 @@ def test_grpo_microbatch_train_step_grpo_clip_10_steps(
         "loss": torch.stack(loss_list),
         "policy_log_probs_grad": torch.stack(grad_list),
     }
+    print(f"output: {output}")
+    print(f"grad_list: {grad_list}")
     numpy_snapshot.assert_match(output)

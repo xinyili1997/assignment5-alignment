@@ -131,7 +131,7 @@ def sft_microbatch_train_step(
     Args:
         policy_log_probs: torch.Tensor of shape (batch_size, sequence_length):
             per-token log-probabilities from the SFT policy being trained.
-        response_mask: torch.Tensor of shape (batch_size, sequence_length):    
+        response_mask: torch.Tensor of shape (batch_size, sequence_length):
             1 for response tokens, 0 for prompt/padding.
         gradient_accumulation_steps: int, the number of gradient accumulation steps.
         normalize_constant: int | None, the constant by which to divide the sum. It is fine to leave this as 1.0.
@@ -154,7 +154,7 @@ def sft_microbatch_train_step(
     # Accumulate gradients: call backward() gradient_accumulation_steps times
     # Gradients automatically accumulate in policy_log_probs.grad
     # Use retain_graph=True to keep the computation graph for multiple backward() calls
-    for _ in range(gradient_accumulation_steps -1):
+    for _ in range(gradient_accumulation_steps - 1):
         loss = loss * loss_scale
         loss.backward(retain_graph=True)
 
@@ -332,11 +332,13 @@ def run_compute_per_instance_dpo_loss(
     """
     raise NotImplementedError
 
+
 # ------------------------------------------------------------
 # GPRO.
 # ------------------------------------------------------------
 
-def run_compute_group_normalized_rewards(
+
+def compute_group_normalized_rewards(
     reward_fn: Callable,
     rollout_responses: list[str],
     repeated_ground_truths: list[str],
@@ -344,9 +346,11 @@ def run_compute_group_normalized_rewards(
     advantage_eps: float,
     normalize_by_std: bool,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """
-    Compute rewards for each group of rollout responses,
+    """Compute rewards for each group of rollout responses,
     normalized by the group size.
+
+       Solution 1: A = R_i - mean(R_i)
+       Solution 2: A = (R_i - mean(R_i)) / (std(R_i) + advantage_eps)
 
     For more on GRPO, see:
         DeepSeekMath: https://arxiv.org/abs/2402.03300
@@ -379,13 +383,59 @@ def run_compute_group_normalized_rewards(
                 You may choose what you wish to log here
                 (some statistics of the rewards, etc.).
     """
-    raise NotImplementedError
+    rewards = []
+    for response, ground_truth in zip(rollout_responses, repeated_ground_truths):
+        rewards.append(reward_fn(response, ground_truth)["reward"])
+    # print(f"rewards: {rewards}")
+    rewards = torch.tensor(rewards)
 
-def run_compute_naive_policy_gradient_loss(
+    # Reshape rewards to (n_prompts_per_rollout_batch, group_size) for group-wise operations
+    rewards_2d = rewards.view(
+        -1, group_size
+    )  # Shape: (n_prompts_per_rollout_batch, group_size)
+
+    # Compute mean within each group
+    group_means = rewards_2d.mean(
+        dim=1, keepdim=True
+    )  # Shape: (n_prompts_per_rollout_batch, 1)
+
+    if not normalize_by_std:
+        # Advantages = rewards - mean(rewards within group)
+        advantages_2d = rewards_2d - group_means
+    else:
+        # Compute std within each group
+        group_stds = rewards_2d.std(
+            dim=1, keepdim=True
+        )  # Shape: (n_prompts_per_rollout_batch, 1)
+        # Advantages = (rewards - mean) / (std + eps)
+        advantages_2d = (rewards_2d - group_means) / (group_stds + advantage_eps)
+
+    # Reshape back to original shape
+    advantages = advantages_2d.view(-1)  # Shape: (rollout_batch_size,)
+
+    return [
+        advantages,
+        rewards,
+        {
+            "mean_reward": rewards.mean().item(),
+            "std_reward": rewards.std().item(),
+        },
+    ]
+
+
+def compute_naive_policy_gradient_loss(
     raw_rewards_or_advantages: torch.Tensor,
     policy_log_probs: torch.Tensor,
 ) -> torch.Tensor:
     """Compute policy gradient loss using either raw rewards or advantages.
+
+    log_prob * advantage is the "surrogate objective" whose gradient pushes
+    probability up for actions with positive advantage and down for negative
+    advantage.
+
+    log_prob: indicates the direction to increase the probability of the action.
+    If A > 0: action was better than expected → increase its probability.
+    If A < 0: action was worse than expected → decrease its probability.
 
     Args:
         raw_rewards_or_advantages: torch.Tensor of shape (batch_size, 1):
@@ -397,15 +447,28 @@ def run_compute_naive_policy_gradient_loss(
         torch.Tensor of shape (batch_size, sequence_length):
             the policy gradient per-token loss.
     """
-    raise NotImplementedError
+    broadcasted_rewards_or_advantages = raw_rewards_or_advantages.expand_as(
+        policy_log_probs
+    )
+    result = -broadcasted_rewards_or_advantages * policy_log_probs
+    print(f"result: {result}")
+    return result
 
-def run_compute_grpo_clip_loss(
+
+def compute_grpo_clip_loss(
     advantages: torch.Tensor,
     policy_log_probs: torch.Tensor,
     old_log_probs: torch.Tensor,
     cliprange: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the GRPO-Clip loss.
+
+    Ratio: policy_log_probs / old_log_probs
+    Clip:
+        if 1-cliprange < ratio < 1+cliprange, keep the ratio as is.
+        if ratio < 1-cliprange, set the ratio to 1-cliprange.
+        if ratio > 1+cliprange, set the ratio to 1+cliprange.
+    Loss: - min(ratio * advantages, clip(ratio, cliprange) * advantages)
 
     Args:
         advantages: torch.Tensor of shape (batch_size, 1):
@@ -423,10 +486,21 @@ def run_compute_grpo_clip_loss(
             dict[str, torch.Tensor]: metadata for the GRPO-Clip loss
                 (used to compute clip fraction).
     """
-    raise NotImplementedError
+    # Ratio = exp(policy_log_probs - old_log_probs) = exp(policy) / exp(old)
+    ratio = torch.exp(policy_log_probs - old_log_probs)
+    clipped_ratio = torch.clamp(ratio, 1 - cliprange, 1 + cliprange)
+    advantages_broadcasted = advantages.expand_as(ratio)
+    # print(f"ratio: {ratio}")
+    # print(f"clipped_ratio: {clipped_ratio}")
+    # print(f"advantages_broadcasted: {advantages_broadcasted}")
+    loss = -torch.min(
+        ratio * advantages_broadcasted, clipped_ratio * advantages_broadcasted
+    )
+    # print(f"loss: {loss}")
+    return loss, {"ratio": ratio, "clipped_ratio": clipped_ratio}
 
 
-def run_compute_policy_gradient_loss(
+def compute_policy_gradient_loss(
     policy_log_probs: torch.Tensor,
     loss_type: str,
     raw_rewards: torch.Tensor,
@@ -437,9 +511,20 @@ def run_compute_policy_gradient_loss(
     """
     Wrapper that delegates to the appropriate policy gradient loss function above.
     """
-    raise NotImplementedError
+    if loss_type == "no_baseline":
+        assert raw_rewards is not None
+        # Advantage = raw_rewards
+        return compute_naive_policy_gradient_loss(raw_rewards, policy_log_probs), {}
+    elif loss_type == "reinforce_with_baseline":
+        assert advantages is not None
+        return compute_naive_policy_gradient_loss(advantages, policy_log_probs), {}
+    elif loss_type == "grpo_clip":
+        return compute_grpo_clip_loss(advantages, policy_log_probs, old_log_probs, cliprange)
+    else:
+        raise NotImplementedError
 
-def run_masked_mean(
+
+def masked_mean(
     tensor: torch.Tensor, mask: torch.Tensor, dim: int | None = None
 ) -> torch.Tensor:
     """Compute the mean of the tensor along a dimension,
@@ -457,9 +542,15 @@ def run_masked_mean(
         torch.Tensor, the mean of the tensor along the specified
             dimension, considering only the elements with mask value 1.
     """
-    raise NotImplementedError
+    # Sum the masked elements
+    masked_sum = (tensor * mask).sum(dim=dim)
+    # Count the masked elements (where mask == 1)
+    mask_count = mask.sum(dim=dim)
+    # Mean = sum / count (only over masked elements)
+    return masked_sum / mask_count
 
-def run_grpo_microbatch_train_step(
+
+def grpo_microbatch_train_step(
     policy_log_probs: torch.Tensor,
     response_mask: torch.Tensor,
     gradient_accumulation_steps: int,
@@ -495,5 +586,18 @@ def run_grpo_microbatch_train_step(
         tuple[torch.Tensor, dict[str, torch.Tensor]]:
             the policy gradient loss and its metadata.
     """
-    raise NotImplementedError
+    per_token_loss, metadata = compute_policy_gradient_loss(
+        policy_log_probs=policy_log_probs,
+        loss_type=loss_type,
+        raw_rewards=raw_rewards,
+        advantages=advantages,
+        old_log_probs=old_log_probs,
+        cliprange=cliprange,
+    )
+    masked_loss = masked_mean(per_token_loss, response_mask, dim=None)
+    loss_scale = 1.0 / gradient_accumulation_steps
+    loss = masked_loss * loss_scale
 
+    for _ in range(gradient_accumulation_steps - 1):
+        loss.backward(retain_graph=True)
+    return loss, metadata
